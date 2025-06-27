@@ -1,3 +1,4 @@
+import re # For parsing reference strings
 import requests
 from difflib import SequenceMatcher
 from urllib.parse import quote_plus
@@ -209,14 +210,17 @@ def get_apa_citation_from_doi(doi, mailto_email=None, user_agent=None):
         return None
 
 # --- High-Level Search/Utility Functions ---
-def find_and_cite_reference(reference_text, expected_title, mailto_email=None, user_agent=None):
+def find_and_cite_reference(reference_text, expected_title=None, mailto_email=None, user_agent=None):
     """
-    Searches for a reference using its text, matches its title against an expected title,
-    and returns an APA citation if a sufficiently strong match is found.
+    Searches for a reference using its text, attempts to parse authors, year, and title
+    from the reference_text, then queries CrossRef. Results are scored based on matching
+    these parsed fields and the expected_title (if provided).
+    Returns an APA citation if a high-confidence match is found.
 
     Args:
         reference_text (str): The free-text of the reference to search for.
-        expected_title (str): The title expected for the reference, used for similarity matching.
+        expected_title (str, optional): The specific title to match against. If not provided,
+                                        a title will be parsed from reference_text.
         mailto_email (str, optional): Email for polite API usage.
         user_agent (str, optional): Custom User-Agent string.
 
@@ -224,47 +228,264 @@ def find_and_cite_reference(reference_text, expected_title, mailto_email=None, u
         str: An APA-formatted citation if a good match is found, otherwise a message indicating
              the outcome (e.g., no results, low similarity, or error retrieving citation).
     """
-    search_params = {"keyword": reference_text}
-    # Using a small number of rows as we only need the top matches for similarity check
+
+    # Step 1: Parse authors, year, and title from reference_text
+    parsed_authors = _parse_authors_from_reference(reference_text)
+    parsed_year = _parse_year_from_reference(reference_text)
+
+    # Use expected_title if provided, otherwise try to parse title from reference_text
+    title_to_match_against = expected_title
+    if not title_to_match_against:
+        title_to_match_against = _parse_title_from_reference(reference_text, parsed_authors, parsed_year)
+
+    # print(f"Debug Parsed: Authors: {parsed_authors}, Year: {parsed_year}, Title to match: '{title_to_match_against}'")
+
+    # Step 2: Construct search_params for CrossRef API
+    search_params = {"keyword": reference_text} # query.bibliographic is a good general starting point
+
+    # Add parsed fields to narrow down the search if they exist
+    if parsed_authors:
+        search_params["author"] = " ".join(parsed_authors) # Send as a single string; API handles it
+    if parsed_year:
+        search_params["publication_year_from"] = parsed_year
+        search_params["publication_year_to"] = parsed_year
+    if title_to_match_against and not expected_title: # If we parsed a title, add it to search query
+        search_params["title"] = title_to_match_against
+    elif expected_title : # If user provided an expected title, use that for a more specific query title
+         search_params["title"] = expected_title
+
+
+    # print(f"Debug search_params: {search_params}")
+
+    # Using a small number of rows initially, as the top results are most relevant
     results = search_crossref_api(search_params, rows=5, mailto_email=mailto_email, user_agent=user_agent)
 
     if not results:
-        return "No results found for your query."
+        return f"No API results found for query based on: {reference_text[:100]}..."
 
-    best_match_citation = None
-    highest_similarity = 0.0
+    best_match_item = None
+    highest_overall_score = -1.0
+
+    # Normalize the title to match against (from input)
+    normalized_input_title = ""
+    if title_to_match_against:
+        normalized_input_title = title_to_match_against.lower().strip()
+        normalized_input_title = re.sub(r'[^\w\s]', '', normalized_input_title) # Keep only word chars and spaces
 
     for item in results:
-        title_list = item.get("title")
-        if not title_list or not isinstance(title_list, list) or not title_list[0]:
-            # print(f"Skipping item due to missing or invalid title: {item.get('DOI')}")
-            continue
+        # --- Title Score ---
+        item_title_list = item.get("title")
+        current_item_title_str = ""
+        if item_title_list and isinstance(item_title_list, list) and item_title_list[0]:
+            current_item_title_str = item_title_list[0]
 
-        current_title = title_list[0]
-        similarity = SequenceMatcher(None, expected_title.lower(), current_title.lower()).ratio()
+        normalized_item_title = current_item_title_str.lower().strip()
+        normalized_item_title = re.sub(r'[^\w\s]', '', normalized_item_title)
 
-        # print(f"Debug: Comparing '{expected_title.lower()}' with '{current_title.lower()}'. Similarity: {similarity:.2f}")
+        title_score = 0.0
+        if normalized_input_title and normalized_item_title: # Ensure both titles are non-empty
+             title_score = SequenceMatcher(None, normalized_input_title, normalized_item_title).ratio()
 
-        if similarity > highest_similarity:
-            highest_similarity = similarity
-            doi = item.get("DOI")
+        # --- Author Score ---
+        author_score = 0.0
+        item_authors_list = item.get("author", [])
+        if parsed_authors and item_authors_list:
+            item_author_last_names = []
+            for author_obj in item_authors_list:
+                if isinstance(author_obj, dict) and author_obj.get("family"):
+                    item_author_last_names.append(author_obj.get("family").lower())
+
+            match_count = 0
+            for pa_norm in [pa.lower() for pa in parsed_authors]:
+                if pa_norm in item_author_last_names:
+                    match_count += 1
+            if parsed_authors: # Avoid division by zero
+                author_score = match_count / len(parsed_authors)
+        elif not parsed_authors: # If no authors parsed from input, don't penalize/reward based on authors
+            author_score = 0.5 # Neutral score if input authors are unknown
+
+        # --- Year Score ---
+        year_score = 0.0
+        api_year_str = "N/A"
+        try:
+            # Try to get year from 'published-print', then 'published-online', then 'created'
+            year_sources = [
+                item.get("published-print", {}).get("date-parts", [[]])[0],
+                item.get("published-online", {}).get("date-parts", [[]])[0],
+                item.get("created", {}).get("date-parts", [[]])[0]
+            ]
+            for date_parts in year_sources:
+                if date_parts and date_parts[0] is not None: # Check if year part exists
+                    api_year_str = str(date_parts[0])
+                    break
+        except (IndexError, TypeError):
+            api_year_str = "N/A"
+
+        if parsed_year and api_year_str == parsed_year:
+            year_score = 1.0
+        elif not parsed_year: # If no year parsed from input, neutral score
+            year_score = 0.5
+
+        # --- Overall Confidence Score ---
+        # Weights can be tuned. Title is often most important.
+        # If expected_title was provided by user, title_score is more reliable.
+        # If title was parsed from ref_string, it's less reliable.
+        # --- SCORING WEIGHTS (Tunable Parameters) ---
+        title_weight = 0.6 if expected_title else 0.4
+        author_weight = 0.3
+        year_weight = 0.1 if expected_title else 0.3 # Year becomes more important if title is parsed
+        # Ensure weights sum to 1 (or are normalized later if not)
+        # Current sum: (0.6+0.3+0.1 = 1.0) or (0.4+0.3+0.3 = 1.0)
+
+        overall_score = (title_weight * title_score) + \
+                        (author_weight * author_score) + \
+                        (year_weight * year_score)
+
+        # --- Uncomment for detailed scoring debug ---
+        # print(f"Debug Item: DOI: {item.get('DOI')}, Title: '{current_item_title_str[:60]}...'")
+        # print(f"  Parsed Fields: Authors: {parsed_authors}, Year: {parsed_year}, Input Title: '{title_to_match_against[:60]}'")
+        # print(f"  API Fields: Authors: {[a.get('family','N/A') for a in item_authors_list][:3]}, Year: {api_year_str}")
+        # print(f"  Scores: Title={title_score:.2f} (w:{title_weight:.1f}), Author={author_score:.2f} (w:{author_weight:.1f}), Year={year_score:.2f} (w:{year_weight:.1f})")
+        # print(f"  Overall Score: {overall_score:.2f}\n")
+        # --- End Debug ---
+
+        if overall_score > highest_overall_score:
+            highest_overall_score = overall_score
+            best_match_item = item # Store the whole item
+            best_match_item["_calculated_score"] = overall_score # Attach score for later use
+            best_match_item["_matched_api_year"] = api_year_str # For debugging
+
+    if best_match_item:
+        # print(f"Debug: Best overall candidate DOI: {best_match_item.get('DOI')}, Final Score: {best_match_item['_calculated_score']:.2f}")
+
+        # --- CONFIDENCE THRESHOLD (Tunable Parameter) ---
+        # This threshold determines the minimum score for a match to be considered confident.
+        CONFIDENCE_THRESHOLD = 0.65
+
+        if best_match_item["_calculated_score"] >= CONFIDENCE_THRESHOLD:
+            doi = best_match_item.get("DOI")
             if doi:
                 citation = get_apa_citation_from_doi(doi, mailto_email=mailto_email, user_agent=user_agent)
                 if citation:
-                    best_match_citation = (similarity, citation)
+                    api_title = best_match_item.get('title',[""])[0]
+                    authors_display = ", ".join([a.get('family', '') for a in best_match_item.get('author', []) if a.get('family')])
+                    year_display = best_match_item["_matched_api_year"]
+
+                    # Return more detailed info for user to assess
+                    return (f"Status: Found\n"
+                            f"Original Reference: {reference_text}\n"
+                            f"Matched Title: {api_title}\n"
+                            f"Matched Authors: {authors_display}\n"
+                            f"Matched Year: {year_display}\n"
+                            f"DOI: {doi}\n"
+                            f"APA Citation: {citation}\n"
+                            f"Confidence Score: {best_match_item['_calculated_score']:.2f}")
                 else:
-                    best_match_citation = (similarity, f"Found matching title (similarity: {similarity:.2f}), but failed to retrieve APA citation for DOI: {doi}")
-            else:
-                best_match_citation = (similarity, f"Found matching title '{current_title}' (similarity: {similarity:.2f}) but no DOI available.")
-
-    if best_match_citation:
-        similarity_score, message = best_match_citation
-        if similarity_score >= 0.85: # Adjusted threshold slightly, can be tuned
-            return message
+                    return (f"Status: Found (High Confidence - Score: {best_match_item['_calculated_score']:.2f}), "
+                            f"but failed to retrieve APA citation for DOI: {doi}.\n"
+                            f"Matched Title: {best_match_item.get('title',[''])[0]}")
+            else: # Should not happen if we only consider items with DOI
+                 return f"Status: Error - High confidence match found but item has no DOI. Score: {best_match_item['_calculated_score']:.2f}"
         else:
-            return f"No title found with sufficient similarity (highest was {similarity_score:.2f}). Best match: {message}"
+            api_title = best_match_item.get('title',[""])[0]
+            return (f"Status: Low Confidence Match\n"
+                    f"Original Reference: {reference_text}\n"
+                    f"Input Title for Match: '{title_to_match_against}'\n"
+                    f"Highest score was {best_match_item['_calculated_score']:.2f} for title '{api_title}'. This is below the threshold of {CONFIDENCE_THRESHOLD}.")
 
-    return "No matching title found with sufficient similarity."
+    return (f"Status: No Confident Match Found\n"
+            f"Original Reference: {reference_text}\n"
+            f"Input Title for Match: '{title_to_match_against}'")
+
+
+# --- Helper functions for parsing reference strings ---
+def _parse_authors_from_reference(ref_string):
+    """
+    Rudimentary parsing of author last names from a reference string.
+    Focuses on patterns like "Author, A." or "Author1, A. & Author2, B."
+    Returns a list of probable last names. This is a simplified parser.
+    """
+    authors = []
+    # Try to find text before a potential year pattern like (YYYY) or a title start
+    # This is very heuristic.
+    # Look for patterns like "Lastname, F." or "Lastname F."
+    # Also "Name1, F., Name2, G., & Name3, H."
+    # Or "Name1 F, Name2 G & Name3 H"
+
+    # Simplified: find capitalized words before a year or common title start cues
+    # This regex looks for sequences of capitalized words, possibly with initials/et al.
+    # Stops if it sees a year in parentheses or a quote indicating a title.
+    author_part_match = re.match(r"^(.*?)(?=\s*(?:\(\d{4}\)|\"\w|\'\w|[\w\s]+[.:]\s*\w))", ref_string)
+    if author_part_match:
+        author_segment = author_part_match.group(1)
+        # Split by common delimiters like '&', 'and', ','
+        potential_authors = re.split(r'\s*&\s*|\s+and\s+|\s*,\s*(?=[A-Z])', author_segment)
+        for pa in potential_authors:
+            # Take the first capitalized word as a likely last name
+            name_match = re.match(r"([A-Z][a-z'-]+)", pa.strip())
+            if name_match:
+                authors.append(name_match.group(1))
+    return list(set(authors)) # Return unique names
+
+def _parse_year_from_reference(ref_string):
+    """
+    Parses a 4-digit year, typically enclosed in parentheses.
+    Returns the year as a string, or None.
+    """
+    match = re.search(r'\((\d{4})\)', ref_string)
+    if match:
+        return match.group(1)
+    # Try without parentheses as a fallback
+    match = re.search(r'\b(\d{4})\b', ref_string)
+    if match:
+        # Ensure it's a plausible year (e.g., not a page number)
+        year_candidate = match.group(1)
+        if 1700 < int(year_candidate) < 2100: # Basic plausibility
+             # Check context: avoid matching if it's likely part of a title or series info
+            prev_char_index = match.start() - 1
+            if prev_char_index >=0 and ref_string[prev_char_index].isdigit(): # e.g. part of an ISBN or page range
+                return None
+            return year_candidate
+    return None
+
+def _parse_title_from_reference(ref_string, authors, year):
+    """
+    Rudimentary parsing of a title from a reference string,
+    assuming authors and year have been identified.
+    This is very heuristic.
+    """
+    temp_ref = ref_string
+    # Remove authors part
+    # This is tricky because author formats vary wildly.
+    # A simple approach: if authors were found, try removing substrings that look like them from the start.
+    # This part needs to be much more robust for real-world use.
+    # For now, let's try to find the part after the year.
+
+    if year:
+        year_match = re.search(r'(\(\s*' + re.escape(year) + r'\s*\)|' + re.escape(year) + r')\.?', temp_ref)
+        if year_match:
+            temp_ref = temp_ref[year_match.end():].strip()
+            # Often the title is the first significant chunk of text after the year.
+            # It might end before a journal name, "In:", "Vol.", "pp.", etc.
+            title_match = re.match(r'^(.*?)(?=\s+(?:In\s|Vol\.|[A-Z][a-zÀ-ÿ\s]+(?:Journal|Conference|Proceedings|Book|Press|University|Review)|https://doi\.org|doi:|$))', temp_ref)
+            if title_match:
+                title_candidate = title_match.group(1).strip().rstrip('.:,')
+                # Further clean up: if it's enclosed in quotes, remove them.
+                if (title_candidate.startswith('"') and title_candidate.endswith('"')) or \
+                   (title_candidate.startswith("'") and title_candidate.endswith("'")):
+                    title_candidate = title_candidate[1:-1]
+                return title_candidate.strip()
+    # Fallback: if no year, or title not found after year, this is very hard.
+    # Maybe return a large chunk of the latter part of the string.
+    # This part is highly experimental and likely to be inaccurate.
+    # A better approach would involve more sophisticated NLP or library-based parsing.
+    if len(ref_string) > 120: # take last 120 chars if ref string is long and no other cues found
+        title_candidate = ref_string[-120:].strip()
+        # Attempt to remove trailing journal/page info if it looks like it
+        title_candidate = re.sub(r'\.\s+(?:[A-Z][\w\s&]+(?:Journal|Conf|Proc|Rev|Bull)|Vol\.|pp\.|\d+[:\-\(]).*$', '', title_candidate)
+        return title_candidate.strip('.:, ')
+    return ref_string.strip('.:, ') # as a last resort, the (cleaned) whole string
+
 
 # --- Functions for Conceptual Backend Support for Alerts/RSS ---
 def get_new_works(search_criteria_params, since_datetime_str, date_type="from-index-date", rows=20, mailto_email=None, user_agent=None):
@@ -341,7 +562,7 @@ if __name__ == "__main__":
     print("--- Example 1: Find and Cite Reference ---")
     dummy_reference_text = "The effect of climate change on biodiversity"
     dummy_expected_title = "Climate change and sustainability of biodiversity" # Example, likely won't match perfectly
-    
+
     # It's good practice to provide a real email if you are using this script frequently
     user_email = "testing@example.com" # Using a testing email
 
@@ -507,4 +728,23 @@ if __name__ == "__main__":
     #     print("Error occurred while fetching new works (created date).")
     # print("\n")
 
+    # --- Example 9: Test specific problematic reference for accuracy improvement ---
+    print("--- Example 9: Accuracy Test for 'Maine & Bell' Reference ---")
+    problematic_reference = "Maine, R., & Bell, S. (2024). Financial Dependency and Infrastructure Debt in Small Island Developing States."
+    # We don't provide an expected_title here, to rely on the parser and multi-factor matching.
+    # If we had an exact expected title from a bibliography, we could provide it.
+    accuracy_test_result = find_and_cite_reference(problematic_reference, mailto_email=user_email)
+    print(f"Result for problematic reference:\n{accuracy_test_result}\n")
+
+    another_problematic_ref = "Shannon, C. E. (1948). A mathematical theory of communication. Bell System Technical Journal, 27(3), 379-423."
+    shannon_expected_title = "A mathematical theory of communication" # Providing expected title
+    accuracy_test_result_2 = find_and_cite_reference(another_problematic_ref, expected_title=shannon_expected_title, mailto_email=user_email)
+    print(f"Result for Shannon reference (with expected title):\n{accuracy_test_result_2}\n")
+
+    # Test with a known good DOI to see if it can find it
+    # Reference for DOI: 10.1038/s41586-021-03317-6 (DeepMind AlphaFold paper)
+    alphafold_ref_text = "Jumper, J., et al. (2021). Highly accurate protein structure prediction with AlphaFold. Nature, 596(7873), 583-589."
+    alphafold_expected_title = "Highly accurate protein structure prediction with AlphaFold"
+    alphafold_result = find_and_cite_reference(alphafold_ref_text, expected_title=alphafold_expected_title, mailto_email=user_email)
+    print(f"Result for AlphaFold reference:\n{alphafold_result}\n")
 
