@@ -371,21 +371,13 @@ def find_and_cite_reference(reference_text, expected_title=None, mailto_email=No
                     authors_display = ", ".join([a.get('family', '') for a in best_match_item.get('author', []) if a.get('family')])
                     year_display = best_match_item["_matched_api_year"]
 
-                    # Return more detailed info for user to assess
-                    return (f"Status: Found\n"
-                            f"Original Reference: {reference_text}\n"
-                            f"Matched Title: {api_title}\n"
-                            f"Matched Authors: {authors_display}\n"
-                            f"Matched Year: {year_display}\n"
-                            f"DOI: {doi}\n"
-                            f"APA Citation: {citation}\n"
-                            f"Confidence Score: {best_match_item['_calculated_score']:.2f}")
+                    # Return only the APA citation string for a confident, successful match
+                    return citation
                 else:
-                    return (f"Status: Found (High Confidence - Score: {best_match_item['_calculated_score']:.2f}), "
-                            f"but failed to retrieve APA citation for DOI: {doi}.\n"
-                            f"Matched Title: {best_match_item.get('title',[''])[0]}")
-            else: # Should not happen if we only consider items with DOI
-                 return f"Status: Error - High confidence match found but item has no DOI. Score: {best_match_item['_calculated_score']:.2f}"
+                    return (f"Status: Matched DOI {doi} (Score: {best_match_item['_calculated_score']:.2f}), "
+                            f"but failed to retrieve APA citation. Matched Title: {best_match_item.get('title',[''])[0]}")
+            else: # Should not happen if we only consider items with DOI for citation
+                 return f"Status: Error - High confidence match (Score: {best_match_item['_calculated_score']:.2f}) found but item has no DOI."
         else:
             api_title = best_match_item.get('title',[""])[0]
             return (f"Status: Low Confidence Match\n"
